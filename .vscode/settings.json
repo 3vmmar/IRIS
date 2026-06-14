@@ -1,0 +1,12 @@
+{
+  "python.defaultInterpreterPath": "C:\\IRIS\\IRIS\\.venv\\Scripts\\python.exe",
+  "python.analysis.extraPaths": ["C:\\IRIS\\IRIS"],
+  "python.analysis.venvPath": "C:\\IRIS\\IRIS",
+  "python.analysis.venv": ".venv",
+  "python.terminal.activateEnvironment": true,
+  "python.terminal.activateEnvInCurrentTerminal": true,
+  "python.analysis.typeCheckingMode": "basic",
+  "python.analysis.autoImportCompletions": true,
+  "python.analysis.diagnosticMode": "workspace",
+  "pyrefly.enabled": false
+}

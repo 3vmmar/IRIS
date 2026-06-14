@@ -1,0 +1,40 @@
+# ── FastAPI server stack ──────────────────────────────────────────────────────
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+websockets==14.1
+python-multipart==0.0.20
+httpx==0.28.1
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+pydantic==2.10.4
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
+
+# ── Computer vision ───────────────────────────────────────────────────────────
+opencv-python==4.10.0.84
+ultralytics==8.3.55          # YOLO11 — latest stable Ultralytics release
+numpy==2.2.3                 # numpy 2.x required for Python 3.13
+Pillow==11.1.0
+
+# ── Anthropic SDK ─────────────────────────────────────────────────────────────
+anthropic==0.42.0
+
+# ── Speech-to-text ────────────────────────────────────────────────────────────
+faster-whisper==1.1.0
+silero-vad==5.1.2
+torch==2.6.0                 # silero-vad requires torch; 2.6.0 is minimum on Python 3.13
+torchaudio==2.6.0
+
+# ── Text-to-speech ────────────────────────────────────────────────────────────
+# Coqui TTS and kokoro both cap at Python <3.13.
+# edge-tts uses Microsoft Edge's free neural TTS — no API key, fully Python 3.13 compatible.
+edge-tts==7.0.2
+pydub==0.25.1                # optional: MP3→WAV conversion (requires system ffmpeg)
+soundfile==0.12.1            # WAV read/write for STT audio input
+elevenlabs==1.50.5           # ElevenLabs API client (optional premium voice)
+
+# ── Async SQLite ──────────────────────────────────────────────────────────────
+aiosqlite==0.20.0
+
+# ── Audio I/O ─────────────────────────────────────────────────────────────────
+sounddevice==0.5.1           # microphone capture for STT

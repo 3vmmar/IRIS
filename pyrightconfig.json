@@ -1,0 +1,16 @@
+{
+  "include": ["."],
+  "exclude": [".venv", "**/__pycache__", "**/node_modules", "frontend"],
+  "venvPath": "C:\\IRIS\\IRIS",
+  "venv": ".venv",
+  "pythonVersion": "3.13",
+  "pythonPlatform": "Windows",
+  "pythonPath": "C:\\IRIS\\IRIS\\.venv\\Scripts\\python.exe",
+  "typeCheckingMode": "basic",
+  "useLibraryCodeForTypes": true,
+  "reportMissingImports": true,
+  "reportMissingModuleSource": false,
+  "reportGeneralTypeIssues": "warning",
+  "reportOptionalMemberAccess": "warning",
+  "reportAttributeAccessIssue": "warning"
+}
