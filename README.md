@@ -1,78 +1,105 @@
-# IRIS — Intelligent Real-time Interactive Sensing
+<div align="center">
 
-> A multimodal AI agent that sees through your camera, listens through your microphone, remembers what it observes, and responds in natural language and voice.
+#  IRIS
 
-![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat&logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-WebSocket-009688?style=flat&logo=fastapi&logoColor=white)
-![YOLOv8](https://img.shields.io/badge/YOLOv8-Object_Detection-purple?style=flat)
-![Whisper](https://img.shields.io/badge/Whisper-STT-orange?style=flat)
-![License](https://img.shields.io/badge/License-MIT-green?style=flat)
+### Intelligent Real-time Interactive Sensing
+
+*A real-time multimodal AI agent that sees, listens, remembers, and responds.*
+
+[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-WebSocket-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![YOLO26](https://img.shields.io/badge/YOLO26-Object_Detection-purple?style=flat-square)](https://ultralytics.com/)
+[![Claude](https://img.shields.io/badge/Claude-Vision_LLM-CC785C?style=flat-square&logo=anthropic&logoColor=white)](https://anthropic.com/)
+[![Whisper](https://img.shields.io/badge/Whisper-STT-orange?style=flat-square)](https://github.com/openai/whisper)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
+
+</div>
 
 ---
 
-## What IRIS Does
+## Overview
 
-IRIS is a real-time multimodal AI agent that connects your camera and microphone to a vision-language pipeline. You speak a question, IRIS sees the frame, reasons about it, and responds in voice and text.
+IRIS is a real-time multimodal AI agent that connects your camera and microphone to a vision-language pipeline. Point the camera at any environment, speak a question, and IRIS sees the frame, reasons about it, and responds in both text and voice.
 
 ```
+You:   "What's on my desk?"
+IRIS:  "I can see a laptop, a phone, a water bottle, and two pens.
+        The monitor is displaying a code editor."
+
 You:   "Where did I leave my keys?"
-IRIS:  "I last saw your keys on the left side of the desk, about 12 minutes ago."
+IRIS:  "I last saw your keys in the bottom-left zone, about 8 minutes ago."
 
-You:   "What's on my desk right now?"
-IRIS:  "I can see a laptop, a water bottle, a phone, and two pens. The monitor
-        is on and appears to be showing a code editor."
-
-You:   "Is anything out of place?"
+You:   "Is anything unusual?"
 IRIS:  "There's a cable hanging near the edge of the desk that wasn't there earlier."
 ```
+
+IRIS is not a demo wrapper around a single API call. It is a fully async, multi-threaded perception system — the same architecture pattern used in production visual AI agents.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        INPUT LAYER                          │
-│   Camera (OpenCV 30fps)          Microphone (silero-VAD)    │
-└──────────────┬───────────────────────────┬──────────────────┘
-               │ async frame queue          │ audio chunks
-┌──────────────▼───────────────────────────▼──────────────────┐
-│                        VISION LAYER                         │
-│   YOLOv8 detector (~6fps)    Scene diff    Whisper STT      │
-└──────────────┬───────────────────────────┬──────────────────┘
-               │ detections + frame         │ transcribed text
-┌──────────────▼───────────────────────────▼──────────────────┐
-│                         BRAIN LAYER                         │
-│   VLM (GPT-4o-mini / Qwen2.5-VL)  +  Visual Memory (SQLite)│
-│   Conversation context (rolling window)                     │
-└──────────────┬───────────────────────────┬──────────────────┘
-               │ text tokens (streaming)    │ memory updates
-┌──────────────▼───────────────────────────▼──────────────────┐
-│                        OUTPUT LAYER                         │
-│   Text stream (WebSocket)         TTS (Coqui / ElevenLabs)  │
-│   BBox overlay (Canvas)           Memory log panel          │
-└──────────────┬────────────────────────────────────────────  ┘
-               │
-┌──────────────▼──────────────────────────────────────────────┐
-│              FastAPI + WebSocket Server                     │
-│              HTML/JS Frontend (single page)                 │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                          INPUT LAYER                            │
+│                                                                 │
+│        Camera (OpenCV · 30fps)      Microphone (silero-VAD)     │
+└────────────────┬────────────────────────────┬───────────────────┘
+                 │  async frame deque          │  audio chunks
+┌────────────────▼────────────────────────────▼───────────────────┐
+│                         VISION LAYER                            │
+│                                                                 │
+│   YOLO26 detector (~10fps)   Scene diff     faster-whisper STT  │
+└────────────────┬────────────────────────────┬───────────────────┘
+                 │  detections + frame          │  transcribed query
+┌────────────────▼────────────────────────────▼───────────────────┐
+│                          BRAIN LAYER                            │
+│                                                                 │
+│    Claude (claude-haiku-4-5 · claude-sonnet-4-6) via Anthropic API     │
+│    Visual Memory (SQLite · 3×3 zone grid · async writes)        │
+│    Conversation Context (rolling N-turn window)                 │
+└────────────────┬────────────────────────────┬───────────────────┘
+                 │  streamed tokens             │  memory updates
+┌────────────────▼────────────────────────────▼───────────────────┐
+│                         OUTPUT LAYER                            │
+│                                                                 │
+│    Text stream (WebSocket)      TTS (Coqui · ElevenLabs)        │
+│    BBox overlay (Canvas)        Memory log panel                │
+└────────────────┬────────────────────────────────────────────────┘
+                 │
+┌────────────────▼────────────────────────────────────────────────┐
+│              FastAPI + WebSocket Server  ·  HTML/JS Frontend    │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Features
 
-| Feature | Status | Description |
+| Feature | Description |
+|---|---|
+| **Real-time detection** | YOLO26 — the latest Ultralytics release — running at ~10fps with bounding boxes drawn live on canvas |
+| **Visual Q&A** | Ask anything about what the camera sees; Claude reasons over the frame and detection context |
+| **Voice input** | Speak queries; silero-VAD detects start/end of speech before triggering Whisper |
+| **Voice output** | AI responds in synthesized speech via Coqui TTS (local) or ElevenLabs (API) |
+| **Visual memory** | IRIS remembers where it last saw objects using a 3×3 spatial zone grid, persisted to SQLite |
+| **Streaming responses** | Tokens stream into the chat panel in real time — no waiting for a full response |
+| **Conversation context** | Full rolling window of prior turns injected into every Claude call |
+| **Scene change detection** | Automatically triggers a new description when the environment changes significantly |
+
+---
+
+## Tech Stack
+
+| Layer | Technology | Why |
 |---|---|---|
-| Real-time object detection | ✅ | YOLOv8s running every 5th frame with bbox overlay on canvas |
-| Visual Q&A | ✅ | Ask anything about what the camera sees |
-| Voice input | ✅ | Speak queries — VAD detects start/end automatically |
-| Voice output | ✅ | AI responds in synthesized speech |
-| Visual memory | ✅ | IRIS remembers where it last saw objects with timestamps |
-| Streaming responses | ✅ | Tokens stream in real-time, no 2-second blank wait |
-| Conversation context | ✅ | Full rolling window of prior turns injected into each query |
-| Web UI | ✅ | Single-page interface: live camera, bbox overlay, chat panel, memory log |
+| Object detection | **YOLO26** (Ultralytics) | Latest YOLO — unifies detection, segmentation, pose, and OBB in one model |
+| Vision-language | **Claude claude-haiku-4-5 / claude-sonnet-4-6** (Anthropic) | Best-in-class vision reasoning with streaming support |
+| Speech-to-text | **faster-whisper** + silero-VAD | CTranslate2-optimized, <400ms latency, runs fully local |
+| Text-to-speech | **Coqui TTS** / ElevenLabs | Local offline voice or premium API voice quality |
+| Backend | **FastAPI** + WebSocket | Async, production-grade, minimal overhead |
+| Memory | **aiosqlite** + SQLite | Zero-config, async writes, no external database |
+| Frontend | Vanilla HTML/JS | No build step, instant iteration, single file |
 
 ---
 
@@ -81,32 +108,56 @@ IRIS:  "There's a cable hanging near the edge of the desk that wasn't there earl
 ```
 iris/
 ├── core/
-│   ├── camera.py          # Background thread: frame capture → deque
-│   ├── detector.py        # Background thread: YOLOv8 inference loop
-│   ├── scene.py           # Scene change detection (triggers VLM calls)
-│   └── memory.py          # SQLite async CRUD — visual memory store
+│   ├── camera.py          # Frame capture thread → thread-safe deque
+│   ├── detector.py        # YOLO26 inference thread → cached detection results
+│   ├── scene.py           # Scene change detection (IoU-delta on label sets)
+│   └── memory.py          # SQLite visual memory with 3×3 zone grid
 ├── voice/
-│   ├── stt.py             # faster-whisper wrapper + silero-VAD
+│   ├── stt.py             # faster-whisper + silero-VAD
 │   └── tts.py             # Coqui TTS / ElevenLabs abstraction
 ├── agent/
-│   ├── brain.py           # VLM call manager + prompt builder
-│   ├── prompts.py         # System prompt templates
+│   ├── brain.py           # Anthropic API call manager, frame encoding, token streaming
+│   ├── prompts.py         # System prompt templates and builder functions
 │   └── context.py         # Rolling conversation buffer
 ├── api/
-│   ├── server.py          # FastAPI app — REST + WebSocket endpoints
-│   └── handlers.py        # WebSocket message protocol handler
+│   ├── server.py          # FastAPI app — REST + WebSocket + static frontend
+│   └── handlers.py        # Per-client WebSocket protocol handler
 ├── frontend/
 │   ├── index.html         # Single-page UI
-│   ├── camera.js          # MediaStream → canvas pipeline
-│   ├── audio.js           # MediaRecorder → WebSocket audio
-│   └── chat.js            # Chat panel + streaming text renderer
-├── config.py              # Pydantic settings (model, frame rate, etc.)
-├── main.py                # Entrypoint: starts all threads + server
+│   ├── camera.js          # MediaStream → canvas + bbox overlay
+│   ├── audio.js           # MediaRecorder → WebSocket audio streaming
+│   └── chat.js            # Streaming token renderer + memory log
+├── config.py              # Pydantic settings (loaded from .env)
+├── main.py                # Entrypoint
 ├── requirements.txt
 ├── Dockerfile
-├── docker-compose.yml
-└── README.md
+└── docker-compose.yml
 ```
+
+---
+
+## Visual Memory
+
+Objects are stored on a 3×3 spatial grid (9 named zones). A write only occurs when:
+
+- Detection confidence ≥ 0.60
+- Same object present for ≥ 3 consecutive frames
+- No existing record for the same class + zone within the last 60 minutes
+
+```sql
+CREATE TABLE sightings (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    object      TEXT    NOT NULL,
+    zone        TEXT    NOT NULL,
+    x_rel       REAL,
+    y_rel       REAL,
+    confidence  REAL,
+    seen_at     TEXT    NOT NULL,
+    session_id  TEXT
+);
+```
+
+Memory context is injected into every Claude prompt so IRIS can answer *"where did I leave X?"* without the object being in frame.
 
 ---
 
@@ -114,57 +165,18 @@ iris/
 
 ```jsonc
 // Client → Server
-{ "type": "audio_chunk",      "data": "<base64>" }
 { "type": "text_query",       "text": "Where is my phone?" }
-{ "type": "request_snapshot"                       }
+{ "type": "audio_chunk",      "data": "<base64 PCM>"       }
+{ "type": "request_snapshot"                               }
 
 // Server → Client
-{ "type": "detections",  "boxes": [...], "frame_id": 42 }
-{ "type": "text_token",  "token": " can"              }  // streaming
-{ "type": "text_done",   "full": "I can see..."        }
-{ "type": "audio_chunk", "data": "<base64 wav>"        }
-{ "type": "memory_update","object": "keys", "zone": "left", "ts": "..." }
-{ "type": "error",       "message": "..."              }
+{ "type": "detections",    "boxes": [...], "frame_id": 42  }
+{ "type": "text_token",    "token": " can"                 }
+{ "type": "text_done",     "full": "I can see..."          }
+{ "type": "audio_chunk",   "data": "<base64 WAV>"          }
+{ "type": "memory_update", "object": "keys", "zone": "bottom-left" }
+{ "type": "error",         "message": "..."                }
 ```
-
----
-
-## Visual Memory
-
-Objects are stored in a 3×3 spatial grid (9 zones) relative to the frame. Each detection write requires:
-- Confidence ≥ 0.6
-- Object present for ≥ 3 consecutive frames
-- Same class + zone within 30 minutes → update record, don't duplicate
-
-```sql
-CREATE TABLE sightings (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    object      TEXT    NOT NULL,
-    zone        TEXT    NOT NULL,   -- e.g. "bottom-right"
-    x_rel       REAL,               -- 0.0–1.0 fractional position
-    y_rel       REAL,
-    confidence  REAL,
-    seen_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
-    session_id  TEXT
-);
-```
-
-Memory is injected into every VLM prompt as structured context so IRIS can answer "where did I leave X?" without the object being in frame.
-
----
-
-## Tech Stack
-
-| Component | Choice | Reason |
-|---|---|---|
-| Object detection | `ultralytics` YOLOv8s | Best speed/accuracy tradeoff, CPU-friendly |
-| Vision-language | GPT-4o-mini (API) or Qwen2.5-VL-7B (local) | GPT-4o-mini for dev speed; swap to local for demo |
-| Speech-to-text | `faster-whisper` base | CTranslate2-optimized, <400ms latency |
-| Voice activity | `silero-vad` | Accurate, fast, local |
-| Text-to-speech | `TTS` (Coqui) | Open-source, offline, natural voice |
-| Backend | `FastAPI` + WebSocket | Async, production-grade |
-| Memory | `aiosqlite` + SQLite | Zero-config, async writes |
-| Frontend | Vanilla HTML/JS | No build step, instant iteration |
 
 ---
 
@@ -175,20 +187,16 @@ git clone https://github.com/3vmmar/iris.git
 cd iris
 
 python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
 pip install -r requirements.txt
 
-# Copy and fill in your API key (if using GPT-4o-mini)
-cp .env.example .env
+cp .env.example .env        # Fill in your Anthropic API key
 ```
 
 ```bash
-# Run
 python main.py
-
-# Open browser
-http://localhost:8000
+# → Open http://localhost:8000
 ```
 
 ### Docker
@@ -203,15 +211,19 @@ docker compose up --build
 
 ```env
 # .env.example
-OPENAI_API_KEY=sk-...          # Required if VLM_BACKEND=openai
-VLM_BACKEND=openai             # openai | local
-LOCAL_MODEL=Qwen/Qwen2.5-VL-7B-Instruct
+
+ANTHROPIC_API_KEY=sk-ant-...      # Required
+VLM_MODEL=claude-haiku-4-5          # claude-haiku-4-5 (fast) | claude-sonnet-4-6 (detailed)
+
 CAMERA_INDEX=0
-FRAME_SKIP=5                   # Run YOLO every Nth frame
-YOLO_MODEL=yolov8s.pt
-WHISPER_MODEL=base
-TTS_ENGINE=coqui               # coqui | elevenlabs
-ELEVENLABS_API_KEY=            # Optional
+FRAME_SKIP=3                      # Run YOLO26 every Nth frame
+YOLO_MODEL=yolo26s.pt             # yolo26n | yolo26s | yolo26m | yolo26l | yolo26x
+
+WHISPER_MODEL=base                # tiny | base | small | medium
+TTS_ENGINE=coqui                  # coqui | elevenlabs
+ELEVENLABS_API_KEY=               # Optional — only if TTS_ENGINE=elevenlabs
+ELEVENLABS_VOICE_ID=              # Optional
+
 MEMORY_WINDOW_MINUTES=60
 CONTEXT_WINDOW_TURNS=10
 PORT=8000
@@ -219,19 +231,13 @@ PORT=8000
 
 ---
 
-## Roadmap
-
-- [x] Week 1 — The Eyes: camera pipeline, YOLO detection, WebSocket frame stream, basic VLM Q&A
-- [ ] Week 2 — The Brain: voice input, conversation memory, context injection, memory retrieval routing
-- [ ] Week 3 — The Face: TTS output, polished web UI, memory log panel, Docker, demo video
-
----
-
 ## Author
 
-**Ammar** — Computer Science & AI, Zewail City of Science and Technology  
-AI Engineer · [GitHub](https://github.com/3vmmar)
+**Ammar**  — Computer Science & AI, Zewail City of Science and Technology  
+AI Engineer · [github.com/3vmmar](https://github.com/3vmmar)
 
 ---
 
-*IRIS is a portfolio project demonstrating real-time multimodal AI engineering: async pipelines, vision-language models, local inference, and voice interaction — the same stack used in production AI agent systems.*
+<div align="center">
+<sub>IRIS demonstrates real-world AI engineering: async multi-threaded pipelines, vision-language models, local inference, and voice interaction — the same stack used in production agentic systems.</sub>
+</div>
