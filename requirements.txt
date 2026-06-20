@@ -28,6 +28,7 @@ torchaudio==2.6.0
 # ── Text-to-speech ────────────────────────────────────────────────────────────
 # Coqui TTS and kokoro both cap at Python <3.13.
 # edge-tts uses Microsoft Edge's free neural TTS — no API key, fully Python 3.13 compatible.
+# TTS==0.22.0
 edge-tts==7.0.2
 pydub==0.25.1                # optional: MP3→WAV conversion (requires system ffmpeg)
 soundfile==0.12.1            # WAV read/write for STT audio input

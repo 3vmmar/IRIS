@@ -1,74 +1,62 @@
 """
-Claude API call manager (Anthropic SDK).
-Encodes the current frame as base64 JPEG, builds the full structured prompt,
-and streams response tokens back to the WebSocket handler.
-Uses claude-haiku-4-5 for real-time queries and claude-sonnet-4-6 for deep analysis.
+VLM call manager — coordinates frame encoding, prompt construction,
+context injection, and Claude API streaming.
+
+Every user query and automatic scene description flows through this module.
+
+Imports allowed: config.settings, agent.prompts, agent.context,
+                 anthropic, numpy, PIL.Image, base64, io, time, logging.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import logging
+import time
 from typing import AsyncIterator, Optional
 
 import anthropic
 import numpy as np
+from PIL import Image
 
 from agent.context import ConversationContext
-from agent.prompts import SYSTEM_PROMPT, build_user_message
+from agent import prompts
 from config import settings
-from core.detector import DetectionResult
-from core.memory import VisualMemory
 
 logger = logging.getLogger(__name__)
 
 
-
-class IRISBrain:
+class Brain:
     """Manages all Claude API interactions for IRIS.
 
-    Responsibilities:
-    - Validates the Anthropic API key at query time (not at import time).
-    - Builds the full structured prompt (frame + detections + memory + history).
-    - Streams response tokens via the Anthropic streaming Messages API.
-    - Appends each completed (user, assistant) pair to the context buffer.
-    - Supports model switching between claude-haiku-4-5 (fast) and
-      claude-sonnet-4-6 (detailed) per-query.
+    Owns a :class:`~agent.context.ConversationContext` and an
+    ``AsyncAnthropic`` client. Provides two streaming entry points:
+
+    * :meth:`respond_stream` — user-initiated queries (added to context)
+    * :meth:`describe_scene` — automatic scene descriptions (not in context)
 
     Usage::
 
-        brain = IRISBrain(context=ctx, memory=memory)
+        brain = Brain()
 
-        async for token in brain.query("What do you see?", frame, detections):
-            ws.send_json({"type": "text_token", "token": token})
+        async for token in brain.respond_stream(
+            query="What's on my desk?",
+            frame=frame_bgr,
+            detections=[{"label": "laptop", "confidence": 0.91, "zone": "center"}],
+            memory_context="laptop: center zone, just now",
+        ):
+            await ws.send_json({"type": "text_token", "token": token})
     """
 
-    # Maximum tokens to generate per response
-    _MAX_TOKENS = 1024
+    _MAX_TOKENS = 512
 
-    def __init__(
-        self,
-        context: ConversationContext,
-        memory: VisualMemory,
-    ) -> None:
-        """
-        Args:
-            context: Shared :class:`~agent.context.ConversationContext` instance
-                     that accumulates conversation history across queries.
-            memory:  Initialised :class:`~core.memory.VisualMemory` instance
-                     for retrieving the formatted memory context string.
-        """
-        self._context = context
-        self._memory = memory
-        self._client: Optional[anthropic.AsyncAnthropic] = None
-
-    # ─────────────────────────── lifecycle ────────────────────────────────────
-
-    def init(self) -> None:
-        """Instantiate the Anthropic async client.
+    def __init__(self) -> None:
+        """Initialise the Anthropic client and conversation context.
 
         Raises:
-            RuntimeError: If ``ANTHROPIC_API_KEY`` is empty.
+            RuntimeError: If ``ANTHROPIC_API_KEY`` is empty or unset.
         """
         if not settings.anthropic_api_key:
             raise RuntimeError(
@@ -76,86 +64,186 @@ class IRISBrain:
                 "Add it to .env before starting IRIS."
             )
         self._client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-        logger.info("IRISBrain initialised (model=%s).", settings.vlm_model)
+        self._context = ConversationContext()
+        logger.info("Brain initialised (model=%s).", settings.vlm_model)
 
-    async def close(self) -> None:
-        """Close the Anthropic HTTP client."""
-        if self._client is not None:
-            await self._client.close()
-            self._client = None
+    # ─────────────────────────── frame encoding ───────────────────────────────
 
-    # ─────────────────────────── public API ───────────────────────────────────
-
-    async def query(
-        self,
-        user_text: str,
-        frame: Optional[np.ndarray] = None,
-        detection_result: Optional[DetectionResult] = None,
-        model: Optional[str] = None,
-    ) -> AsyncIterator[str]:
-        """Stream a Claude response token-by-token for the given query.
-
-        Builds the full prompt (vision + detections + memory + history),
-        calls the Anthropic streaming Messages API, and yields each text
-        token as it arrives. Appends the completed turn to context when done.
+    @staticmethod
+    def _encode_frame(frame: np.ndarray) -> str:
+        """Convert an OpenCV BGR frame to a base64-encoded JPEG string.
 
         Args:
-            user_text:        The user's query (text or transcribed voice).
-            frame:            Current camera frame (BGR ndarray) or None.
-            detection_result: Latest YOLO26 result or None.
-            model:            Override the model for this call. Defaults to
-                              ``settings.vlm_model``. Pass
-                              ``"claude-sonnet-4-6"`` for deep-analysis queries.
+            frame: BGR image array (H×W×3, uint8) from OpenCV.
+
+        Returns:
+            Raw base64 string of the JPEG-encoded image (not a data URL).
+        """
+        # BGR → RGB
+        rgb = frame[:, :, ::-1]
+        img = Image.fromarray(rgb)
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+
+    # ─────────────────────────── user queries ─────────────────────────────────
+
+    async def respond_stream(
+        self,
+        query: str,
+        frame: Optional[np.ndarray],
+        detections: list[dict],
+        memory_context: str,
+    ) -> AsyncIterator[str]:
+        """Stream a Claude response for a user query, then commit to context.
+
+        Builds the full structured prompt (detections + memory + image +
+        history), calls the Anthropic streaming API, and yields each text
+        token as it arrives. The completed turn is committed to conversation
+        context after all tokens have been yielded.
+
+        Args:
+            query:          The user's text or transcribed voice query.
+            frame:          Current camera frame (BGR ndarray) or ``None``.
+            detections:     Detection dicts from the latest inference pass.
+            memory_context: Formatted string from
+                            :meth:`~core.memory.VisualMemory.recent_context`.
 
         Yields:
-            Individual text token strings as they stream from the API.
+            Individual text-delta strings from the Claude streaming API.
 
         Raises:
-            RuntimeError: If ``init()`` was not called, or on API failure.
+            RuntimeError: On API authentication or network failure.
         """
-        if self._client is None:
-            raise RuntimeError("IRISBrain.init() has not been called.")
-
-        active_model = model or settings.vlm_model
-
-        # ── Build memory context ──────────────────────────────────────────────
-        try:
-            memory_context = await self._memory.recent_context()
-        except Exception as exc:
-            logger.warning("Memory context retrieval failed: %s", exc)
-            memory_context = ""
-
-        # ── Build message content for this turn ───────────────────────────────
-        user_content = build_user_message(
-            query=user_text,
+        parts: list[str] = []
+        async for token in self._stream_impl(
+            query=query,
             frame=frame,
-            detection_result=detection_result,
+            detections=detections,
             memory_context=memory_context,
-        )
+            model=settings.vlm_model,
+        ):
+            parts.append(token)
+            yield token
 
-        # ── Inject conversation history ───────────────────────────────────────
-        history = self._context.to_messages(SYSTEM_PROMPT)
-        messages = history + [{"role": "user", "content": user_content}]
+        # Commit completed turn
+        full_response = "".join(parts)
+        if full_response:
+            self._context.add_turn(query, full_response)
+            logger.info("Turn committed (%d chars).", len(full_response))
 
-        # ── Stream from Anthropic API ─────────────────────────────────────────
-        full_response_parts: list[str] = []
+    # ─────────────────────────── scene descriptions ───────────────────────────
+
+    async def describe_scene(
+        self,
+        frame: Optional[np.ndarray],
+        detections: list[dict],
+        memory_context: str,
+    ) -> AsyncIterator[str]:
+        """Stream an automatic scene description using the stronger model.
+
+        Uses ``claude-sonnet-4-6`` regardless of ``settings.vlm_model`` since
+        scene descriptions warrant deeper analysis. Does **not** add the
+        result to conversation context (this is an automatic trigger, not
+        a user-initiated turn).
+
+        Args:
+            frame:          Current camera frame or ``None``.
+            detections:     Detection dicts from the latest inference pass.
+            memory_context: Formatted memory context string.
+
+        Yields:
+            Individual text-delta strings.
+        """
+        async for token in self._stream_impl(
+            query="Describe what you see in detail.",
+            frame=frame,
+            detections=detections,
+            memory_context=memory_context,
+            model="claude-sonnet-4-6",
+        ):
+            yield token
+
+    # ─────────────────────────── context management ───────────────────────────
+
+    def clear_context(self) -> None:
+        """Clear all stored conversation turns.
+
+        Call this when starting a new session so prior context does not
+        leak into the new conversation.
+        """
+        self._context.clear()
+        logger.info("Conversation context cleared.")
+
+    # ─────────────────────────── internal streaming ───────────────────────────
+
+    async def _stream_impl(
+        self,
+        query: str,
+        frame: Optional[np.ndarray],
+        detections: list[dict],
+        memory_context: str,
+        model: str,
+    ) -> AsyncIterator[str]:
+        """Core streaming implementation shared by respond_stream and describe_scene.
+
+        Args:
+            query:          User or system query string.
+            frame:          Camera frame or None.
+            detections:     Detection dicts.
+            memory_context: Memory context string.
+            model:          Anthropic model identifier to use.
+
+        Yields:
+            Text-delta tokens from the Claude streaming response.
+        """
+        # ── Build text content ────────────────────────────────────────────────
+        detections_text = prompts.format_detections(detections)
+        user_message    = prompts.build_user_message(query, detections_text, memory_context)
+
+        # ── Build Anthropic content block ─────────────────────────────────────
+        user_content: list[dict] = []
+
+        if frame is not None:
+            try:
+                loop = asyncio.get_event_loop()
+                b64 = await loop.run_in_executor(None, self._encode_frame, frame)
+                user_content.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": b64,
+                    },
+                })
+            except Exception as exc:
+                logger.warning("Frame encoding failed — omitting image: %s", exc)
+
+        user_content.append({"type": "text", "text": user_message})
+
+        # ── Assemble messages ─────────────────────────────────────────────────
+        context_turns = self._context.to_messages(prompts.SYSTEM_PROMPT)
+        messages = prompts.build_messages(context_turns, user_content)
 
         logger.info(
-            "Claude query → model=%s, turns_in_context=%d, has_frame=%s",
-            active_model,
+            "Claude request → model=%s, turns=%d, has_image=%s",
+            model,
             self._context.turn_count(),
             frame is not None,
         )
 
+        # ── Stream from Anthropic ─────────────────────────────────────────────
+        t0 = time.monotonic()
+
         try:
             async with self._client.messages.stream(
-                model=active_model,
+                model=model,
                 max_tokens=self._MAX_TOKENS,
-                system=SYSTEM_PROMPT,
+                system=prompts.SYSTEM_PROMPT,
                 messages=messages,
             ) as stream:
                 async for text_chunk in stream.text_stream:
-                    full_response_parts.append(text_chunk)
                     yield text_chunk
 
         except anthropic.AuthenticationError:
@@ -171,37 +259,5 @@ class IRISBrain:
             yield f"[Error: {exc}]"
             return
 
-        # ── Save completed turn to context ────────────────────────────────────
-        full_response = "".join(full_response_parts)
-        self._context.add_turn(user_text, full_response)
-        logger.info("Claude response complete (%d chars).", len(full_response))
-
-    async def describe_scene(
-        self,
-        frame: Optional[np.ndarray],
-        detection_result: Optional[DetectionResult],
-    ) -> AsyncIterator[str]:
-        """Generate an unsolicited scene description when scene change is detected.
-
-        Uses the fast ``claude-haiku-4-5`` model regardless of the configured
-        default, since scene descriptions are triggered automatically and need
-        to be low-latency.
-
-        Args:
-            frame:            Current camera frame or None.
-            detection_result: Latest YOLO26 result or None.
-
-        Yields:
-            Individual text token strings.
-        """
-        prompt = (
-            "The scene has changed. Briefly describe what you now observe in 1–2 sentences. "
-            "Focus on new or moved objects."
-        )
-        async for token in self.query(
-            user_text=prompt,
-            frame=frame,
-            detection_result=detection_result,
-            model="claude-haiku-4-5",
-        ):
-            yield token
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        logger.debug("Claude response streamed in %.0f ms.", elapsed_ms)

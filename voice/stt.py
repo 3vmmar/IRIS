@@ -1,253 +1,157 @@
 """
-Speech-to-text using faster-whisper with silero-VAD
-for automatic voice activity detection and audio segmentation.
+Speech-to-text using faster-whisper for transcription and silero-VAD
+for voice activity detection. Both run entirely locally — no external API.
+
+Imports allowed: config.settings, faster_whisper, silero_vad, numpy,
+                 sounddevice, soundfile, logging, threading, standard library.
 """
 
 from __future__ import annotations
 
-
-import io
 import logging
-import queue
-import threading
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import numpy as np
-import sounddevice as sd
-import soundfile as sf
-import torch
 from faster_whisper import WhisperModel
-from silero_vad import load_silero_vad
 
 from config import settings
 
 logger = logging.getLogger(__name__)
 
-# ── Audio constants ────────────────────────────────────────────────────────────
-_SAMPLE_RATE   = 16_000   # Hz — Whisper's native rate
-_CHANNELS      = 1
-_CHUNK_MS      = 30       # ms per audio chunk fed to silero-VAD
-_CHUNK_SAMPLES = int(_SAMPLE_RATE * _CHUNK_MS / 1000)
-_SILENCE_PAD_S = 0.3      # seconds of silence appended after VAD end to avoid cut-off
-
 
 class SpeechToText:
-    """Listens to the microphone, detects speech with silero-VAD, and transcribes
-    each utterance with faster-whisper.
+    """Local speech-to-text engine backed by faster-whisper + silero-VAD.
 
-    The transcription callback is called on a dedicated thread with the
-    recognised text so it never blocks the main async event loop.
+    Provides a simple load-then-transcribe interface. The microphone capture
+    and VAD segmentation are handled externally (by the WebSocket handler
+    or a dedicated audio pipeline) — this class only handles transcription
+    of already-captured audio buffers.
 
     Usage::
 
-        def on_transcript(text: str) -> None:
-            print("IRIS heard:", text)
+        stt = SpeechToText()
+        stt.load()
 
-        stt = SpeechToText(callback=on_transcript)
-        stt.start()
-        # … user speaks …
-        stt.stop()
+        text = stt.transcribe_bytes(raw_pcm_bytes)
+        if text:
+            print("User said:", text)
     """
 
-    def __init__(self, callback: Callable[[str], None]) -> None:
+    def __init__(self) -> None:
+        """Initialise model references to ``None``.
+
+        Models are loaded lazily via :meth:`load` so the import of this
+        module is lightweight and never triggers a multi-second download.
         """
-        Args:
-            callback: Called with the transcribed string after each utterance.
-                      Invoked from a background thread — use thread-safe mechanisms
-                      (e.g. ``asyncio.run_coroutine_threadsafe``) to hand off to async code.
-        """
-        self._callback = callback
-        self._model: Optional[WhisperModel] = None
-        self._vad_model: Any = None
-        self._stop_event = threading.Event()
-        self._audio_queue: queue.Queue[np.ndarray] = queue.Queue()
-        self._listen_thread: Optional[threading.Thread] = None
-        self._transcribe_thread: Optional[threading.Thread] = None
+        self._whisper: Optional[WhisperModel] = None
+        self._vad: Any = None   # silero returns OnnxWrapper — use Any to avoid coupling
+        logger.debug("SpeechToText instance created (models not yet loaded).")
 
     # ─────────────────────────── lifecycle ────────────────────────────────────
 
-    def start(self) -> None:
-        """Load models and start the microphone listener + transcription threads.
+    def load(self) -> None:
+        """Load faster-whisper and silero-VAD models.
+
+        Reads ``settings.whisper_model`` for the Whisper model size
+        (``tiny``, ``base``, ``small``, ``medium``). Uses CPU with int8
+        quantisation for ~2× speedup with minimal accuracy loss.
+
+        Logs model identifiers and total load time at INFO level.
 
         Raises:
-            RuntimeError: If the Whisper or VAD model cannot be loaded.
+            RuntimeError: If either model fails to load (missing files,
+                          incompatible Python version, etc.).
         """
-        logger.info("Loading faster-whisper model: %s …", settings.whisper_model)
+        t0 = time.monotonic()
+
+        # ── Whisper ───────────────────────────────────────────────────────────
+        logger.info("Loading faster-whisper model: '%s' …", settings.whisper_model)
         try:
-            self._model = WhisperModel(
+            self._whisper = WhisperModel(
                 settings.whisper_model,
                 device="cpu",
-                compute_type="int8",   # int8 gives ~2× speedup on CPU with minimal WER cost
+                compute_type="int8",
             )
         except Exception as exc:
-            raise RuntimeError(f"Failed to load Whisper model '{settings.whisper_model}': {exc}") from exc
+            raise RuntimeError(
+                f"Failed to load Whisper model '{settings.whisper_model}': {exc}"
+            ) from exc
 
+        # ── Silero VAD ────────────────────────────────────────────────────────
         logger.info("Loading silero-VAD model …")
         try:
-            self._vad_model = load_silero_vad()
+            from silero_vad import load_silero_vad
+            self._vad = load_silero_vad()
         except Exception as exc:
             raise RuntimeError(f"Failed to load silero-VAD: {exc}") from exc
 
-        self._stop_event.clear()
-
-        self._listen_thread = threading.Thread(
-            target=self._listen_loop,
-            name="iris-mic-listener",
-            daemon=True,
-        )
-        self._transcribe_thread = threading.Thread(
-            target=self._transcribe_loop,
-            name="iris-transcriber",
-            daemon=True,
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        logger.info(
+            "STT models loaded in %.0f ms (whisper='%s', vad=silero).",
+            elapsed_ms, settings.whisper_model,
         )
 
-        self._listen_thread.start()
-        self._transcribe_thread.start()
-        logger.info("STT started (model=%s, VAD=silero, sample_rate=%d Hz).",
-                    settings.whisper_model, _SAMPLE_RATE)
+    # ─────────────────────────── transcription ────────────────────────────────
 
-    def stop(self) -> None:
-        """Signal both threads to stop and join with a 3-second timeout each."""
-        logger.info("Stopping STT …")
-        self._stop_event.set()
-        for t in (self._listen_thread, self._transcribe_thread):
-            if t is not None and t.is_alive():
-                t.join(timeout=3.0)
-        logger.info("STT stopped.")
+    def transcribe_bytes(
+        self,
+        audio_bytes: bytes,
+        sample_rate: int = 16_000,
+    ) -> Optional[str]:
+        """Transcribe raw PCM audio bytes to text.
 
-    def is_running(self) -> bool:
-        """Return True if the listener thread is alive."""
-        return self._listen_thread is not None and self._listen_thread.is_alive()
-
-    # ─────────────────────────── transcribe on demand ─────────────────────────
-
-    def transcribe_audio_bytes(self, audio_bytes: bytes) -> str:
-        """Transcribe a raw PCM or WAV byte blob sent over WebSocket.
-
-        Intended for the ``audio_chunk`` WebSocket message type where the
-        client captures audio and sends it as base64-decoded bytes.
+        Accepts 16-bit signed integer PCM, mono channel, at the given
+        sample rate. Internally converts to float32 normalised to
+        [-1.0, 1.0] before passing to faster-whisper.
 
         Args:
-            audio_bytes: Raw audio data. Accepts WAV (with header) or raw
-                         16-bit PCM at 16 kHz mono.
+            audio_bytes: Raw PCM audio data (16-bit signed integers, mono).
+            sample_rate: Sample rate of the input audio in Hz.
+                         Defaults to 16 000 (Whisper's native rate).
 
         Returns:
-            Transcribed text string, stripped of leading/trailing whitespace.
-            Empty string on failure.
+            The transcribed text string, or ``None`` if the result is empty
+            or only whitespace.
         """
-        if self._model is None:
-            logger.warning("transcribe_audio_bytes called before STT is started.")
-            return ""
+        if self._whisper is None:
+            logger.warning("transcribe_bytes called before load() — returning None.")
+            return None
+
+        t0 = time.monotonic()
+
+        # ── Convert PCM bytes → float32 array ─────────────────────────────────
+        audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
+        audio_f32 = audio_int16.astype(np.float32) / 32768.0
+
+        # ── Run faster-whisper inference ──────────────────────────────────────
         try:
-            audio_buf = io.BytesIO(audio_bytes)
-            audio_np, sr = sf.read(audio_buf, dtype="float32")
-            if sr != _SAMPLE_RATE:
-                # Basic resampling: soundfile doesn't resample so we note the mismatch
-                logger.warning("Audio sample rate %d Hz != expected %d Hz.", sr, _SAMPLE_RATE)
-            segments, _ = self._model.transcribe(audio_np, language="en", beam_size=5)
+            segments, _info = self._whisper.transcribe(
+                audio_f32,
+                language="en",
+                beam_size=5,
+                vad_filter=True,
+            )
             text = " ".join(seg.text for seg in segments).strip()
-            logger.debug("Transcribed (bytes input): %r", text)
-            return text
         except Exception as exc:
-            logger.warning("transcribe_audio_bytes failed: %s", exc)
-            return ""
+            logger.warning("Whisper transcription error: %s", exc)
+            return None
 
-    # ─────────────────────────── internal threads ──────────────────────────────
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
 
-    def _listen_loop(self) -> None:
-        """Continuously read microphone chunks and push speech segments to the queue.
+        if not text:
+            logger.debug("Transcription returned empty string (%.0f ms).", elapsed_ms)
+            return None
 
-        Uses silero-VAD to detect start/end of speech. Accumulates audio while
-        VAD reports speech activity, then enqueues the complete utterance for
-        transcription.
+        logger.debug("Transcribed in %.0f ms: %r", elapsed_ms, text)
+        return text
+
+    # ─────────────────────────── status ────────────────────────────────────────
+
+    def is_loaded(self) -> bool:
+        """Return ``True`` if both Whisper and VAD models are loaded.
+
+        Returns:
+            ``True`` when the engine is ready to transcribe.
         """
-        accumulated: list[np.ndarray] = []
-        in_speech = False
-        silence_counter = 0
-        # Number of consecutive silent chunks before we consider the utterance done
-        silence_chunks_threshold = int(0.6 * 1000 / _CHUNK_MS)   # ~600 ms
-
-        def audio_callback(indata: np.ndarray, frames: int,
-                           time_info: object, status: object) -> None:
-            nonlocal accumulated, in_speech, silence_counter
-
-            if status:
-                logger.debug("Sounddevice status: %s", status)
-
-            chunk = indata[:, 0].copy().astype(np.float32)
-            chunk_tensor = torch.from_numpy(chunk)
-
-            try:
-                vad = self._vad_model
-                if vad is not None:
-                    speech_prob = vad(chunk_tensor, _SAMPLE_RATE).item()
-                else:
-                    speech_prob = 0.0
-            except Exception:
-                speech_prob = 0.0
-
-            if speech_prob > 0.5:
-                if not in_speech:
-                    logger.debug("VAD: speech start detected (prob=%.2f).", speech_prob)
-                    in_speech = True
-                silence_counter = 0
-                accumulated.append(chunk)
-            elif in_speech:
-                accumulated.append(chunk)   # include trailing silence for natural cut
-                silence_counter += 1
-                if silence_counter >= silence_chunks_threshold:
-                    # Speech ended — enqueue the utterance
-                    utterance = np.concatenate(accumulated)
-                    self._audio_queue.put(utterance)
-                    logger.debug("VAD: speech end — queued %.2f s of audio.",
-                                 len(utterance) / _SAMPLE_RATE)
-                    accumulated = []
-                    in_speech = False
-                    silence_counter = 0
-
-        try:
-            with sd.InputStream(
-                samplerate=_SAMPLE_RATE,
-                channels=_CHANNELS,
-                dtype="float32",
-                blocksize=_CHUNK_SAMPLES,
-                callback=audio_callback,
-            ):
-                while not self._stop_event.is_set():
-                    time.sleep(0.1)
-        except Exception as exc:
-            logger.error("Microphone listener error: %s", exc)
-
-    def _transcribe_loop(self) -> None:
-        """Pull audio utterances off the queue and transcribe them via Whisper.
-
-        Calls ``self._callback(text)`` for every non-empty transcript.
-        """
-        while not self._stop_event.is_set():
-            try:
-                audio_np: np.ndarray = self._audio_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-
-            if self._model is None:
-                continue
-
-            try:
-                t0 = time.monotonic()
-                segments, info = self._model.transcribe(
-                    audio_np,
-                    language="en",
-                    beam_size=5,
-                    vad_filter=False,   # VAD already applied upstream
-                )
-                text = " ".join(seg.text for seg in segments).strip()
-                elapsed_ms = (time.monotonic() - t0) * 1000
-
-                if text:
-                    logger.info("Transcribed in %.0f ms: %r", elapsed_ms, text)
-                    self._callback(text)
-                else:
-                    logger.debug("Transcription returned empty string — skipping.")
-            except Exception as exc:
-                logger.warning("Transcription error: %s", exc)
+        return self._whisper is not None and self._vad is not None

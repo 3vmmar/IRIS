@@ -1,271 +1,219 @@
 """
-Per-client WebSocket protocol handler.
-
-Incoming message types  : text_query | audio_chunk | request_snapshot
-Outgoing message types  : detections | text_token | text_done
-                          audio_chunk | memory_update | error
-
-Runs a background asyncio task that pushes detection frames to the client
-every 150ms independently of user queries.
+The per-client WebSocket protocol handler.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import json
 import logging
-
 from typing import Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from agent.brain import IRISBrain
-
+from config import settings
+from agent.brain import Brain
 from core.camera import CameraCapture
-from core.detector import DetectionResult, ObjectDetector
+from core.detector import ObjectDetector
 from core.memory import VisualMemory
+from core.scene import SceneChangeDetector
 from voice.stt import SpeechToText
 from voice.tts import TextToSpeech
 
 logger = logging.getLogger(__name__)
 
-# How often to push detection results to the client (ms)
-_DETECTION_PUSH_INTERVAL_S = 0.15
 
+class IRISHandler:
+    """Manages a single WebSocket client session.
 
-class WebSocketHandler:
-    """Manages a single client's WebSocket session.
-
-    One instance is created per connected client. It owns:
-    - A :class:`~agent.context.ConversationContext` scoped to this client.
-    - A background asyncio task that pushes detection frames at 150ms intervals.
-    - Message dispatch for all incoming protocol message types.
-
-    The handler does **not** own the camera, detector, memory, brain, or TTS —
-    those are singletons shared across all clients and injected at construction.
-
-    Usage (called from the FastAPI WebSocket route)::
-
-        handler = WebSocketHandler(ws, detector, memory, brain, tts, stt)
-        await handler.run()
+    Handles real-time detection push loop and incoming message processing
+    (text queries, audio chunks, snapshot requests).
     """
 
     def __init__(
         self,
-        websocket: WebSocket,
+        ws: WebSocket,
+        camera: CameraCapture,
         detector: ObjectDetector,
         memory: VisualMemory,
-        brain: IRISBrain,
+        brain: Brain,
+        stt: SpeechToText,
         tts: TextToSpeech,
-        stt: Optional[SpeechToText],
-        camera: CameraCapture,
     ) -> None:
-        self._ws = websocket
+        self._ws = ws
+        self._camera = camera
         self._detector = detector
         self._memory = memory
         self._brain = brain
-        self._tts = tts
         self._stt = stt
-        self._camera = camera
+        self._tts = tts
+        self._scene_detector = SceneChangeDetector()
+        self._last_frame_id: int = -1
 
-        self._detection_task: Optional[asyncio.Task] = None
-        self._last_sent_frame_id: int = -1
-
-    # ─────────────────────────── session lifecycle ─────────────────────────────
-
-    async def run(self) -> None:
-        """Accept the connection, start the detection push task, and enter the
-        message receive loop. Cleans up when the client disconnects.
-        """
-        await self._ws.accept()
-        logger.info("WebSocket client connected: %s", self._ws.client)
-
-        self._detection_task = asyncio.create_task(self._detection_push_loop())
+    async def handle(self) -> None:
+        """Main entry point. Starts detection push and message processing concurrently."""
+        push_task = asyncio.create_task(self._detection_push_loop())
+        msg_task = asyncio.create_task(self._message_loop())
 
         try:
-            await self._receive_loop()
+            await asyncio.gather(push_task, msg_task)
         except WebSocketDisconnect:
-            logger.info("WebSocket client disconnected: %s", self._ws.client)
-        except Exception as exc:
-            logger.error("WebSocket session error: %s", exc)
+            logger.info("WebSocket disconnected.")
+        except Exception as e:
+            logger.error("Error in handler: %s", e)
         finally:
-            if self._detection_task and not self._detection_task.done():
-                self._detection_task.cancel()
-            logger.info("WebSocket session cleaned up: %s", self._ws.client)
+            push_task.cancel()
+            msg_task.cancel()
 
-    # ─────────────────────────── receive loop ──────────────────────────────────
+    async def _detection_push_loop(self) -> None:
+        """Continuously pushes detection frames to the client."""
+        while True:
+            try:
+                result = self._detector.get_latest()
+                if result is not None and result.frame_id != self._last_frame_id:
+                    # Construct message
+                    boxes = [d.to_dict() for d in result.detections]
+                    await self._send({
+                        "type": "detections",
+                        "boxes": boxes,
+                        "frame_id": result.frame_id,
+                        "width": result.frame_width,
+                        "height": result.frame_height,
+                        "inference_ms": result.inference_ms,
+                        "time_since_last_analysis": self._scene_detector.time_since_last_trigger(),
+                    })
+                    
+                    self._last_frame_id = result.frame_id
 
-    async def _receive_loop(self) -> None:
-        """Continuously receive and dispatch incoming WebSocket messages."""
+                    # Memory observation
+                    for d in result.detections:
+                        is_new = await self._memory.observe(
+                            label=d.label,
+                            zone=d.zone,
+                            x_rel=d.x_rel,
+                            y_rel=d.y_rel,
+                            confidence=d.confidence
+                        )
+                        if is_new:
+                            await self._send({
+                                "type": "memory_update",
+                                "object": d.label,
+                                "zone": d.zone
+                            })
+
+                    # Scene change detection
+                    if self._scene_detector.has_changed(result):
+                        asyncio.create_task(self._auto_describe())
+
+            except Exception as e:
+                logger.error("Detection push loop error: %s", e)
+
+            await asyncio.sleep(0.15)
+
+    async def _auto_describe(self) -> None:
+        """Generates an automatic description of a new scene."""
+        try:
+            frame = self._camera.get_frame()
+            result = self._detector.get_latest()
+            detections = [d.to_dict() for d in result.detections] if result else []
+            memory_context = await self._memory.recent_context()
+
+            full_tokens = []
+            async for token in self._brain.describe_scene(frame, detections, memory_context):
+                await self._send({"type": "text_token", "token": token})
+                full_tokens.append(token)
+            
+            full_text = "".join(full_tokens)
+            await self._send({"type": "text_done", "full": full_text})
+
+            if self._tts.is_loaded():
+                loop = asyncio.get_running_loop()
+                audio_bytes = await loop.run_in_executor(None, self._tts.synthesize, full_text)
+                if audio_bytes:
+                    await self._send({
+                        "type": "audio_chunk",
+                        "data": base64.b64encode(audio_bytes).decode("utf-8")
+                    })
+        except Exception as e:
+            logger.error("Auto describe error: %s", e)
+            await self._send({"type": "error", "message": str(e)})
+
+    async def _message_loop(self) -> None:
+        """Continuously reads incoming client messages."""
         while True:
             raw = await self._ws.receive_text()
             try:
                 msg = json.loads(raw)
+                msg_type = msg.get("type")
+
+                if msg_type == "text_query":
+                    asyncio.create_task(self._handle_text_query(msg.get("text", "")))
+                elif msg_type == "audio_chunk":
+                    asyncio.create_task(self._handle_audio_chunk(msg.get("data", "")))
+                elif msg_type == "request_snapshot":
+                    asyncio.create_task(self._handle_snapshot())
+                else:
+                    await self._send({"type": "error", "message": f"Unknown message type {msg_type}"})
             except json.JSONDecodeError:
-                await self._send_error("Invalid JSON payload.")
-                continue
+                await self._send({"type": "error", "message": "Invalid JSON"})
+            except Exception as e:
+                logger.error("Message loop error: %s", e)
 
-            msg_type = msg.get("type", "")
-
-            if msg_type == "text_query":
-                asyncio.create_task(self._handle_text_query(msg))
-            elif msg_type == "audio_chunk":
-                asyncio.create_task(self._handle_audio_chunk(msg))
-            elif msg_type == "request_snapshot":
-                asyncio.create_task(self._handle_snapshot())
-            else:
-                await self._send_error(f"Unknown message type: '{msg_type}'.")
-
-    # ─────────────────────────── message handlers ─────────────────────────────
-
-    async def _handle_text_query(self, msg: dict) -> None:
-        """Process a ``text_query`` message: stream Claude's response back token-by-token.
-
-        Args:
-            msg: Parsed message dict containing ``"text"`` key.
-        """
-        query = msg.get("text", "").strip()
-        if not query:
-            await self._send_error("text_query message missing 'text' field.")
-            return
-
-        logger.info("text_query: %r", query[:80])
-
-        result = self._detector.get_latest()
-        frame = self._camera.get_frame()
-
-        full_tokens: list[str] = []
-
+    async def _handle_text_query(self, query: str) -> None:
+        """Handles a direct text query from the user."""
         try:
-            async for token in self._brain.query(
-                user_text=query,
-                frame=frame,
-                detection_result=result,
-            ):
-                await self._ws.send_json({"type": "text_token", "token": token})
+            frame = self._camera.get_frame()
+            result = self._detector.get_latest()
+            detections = [d.to_dict() for d in result.detections] if result else []
+            memory_context = await self._memory.recent_context()
+
+            full_tokens = []
+            async for token in self._brain.respond_stream(query, frame, detections, memory_context):
+                await self._send({"type": "text_token", "token": token})
                 full_tokens.append(token)
-        except Exception as exc:
-            logger.error("Brain query error: %s", exc)
-            await self._send_error(str(exc))
-            return
+            
+            full_text = "".join(full_tokens)
+            await self._send({"type": "text_done", "full": full_text})
 
-        full_text = "".join(full_tokens)
-        await self._ws.send_json({"type": "text_done", "full": full_text})
+            if self._tts.is_loaded():
+                loop = asyncio.get_running_loop()
+                audio_bytes = await loop.run_in_executor(None, self._tts.synthesize, full_text)
+                if audio_bytes:
+                    await self._send({
+                        "type": "audio_chunk",
+                        "data": base64.b64encode(audio_bytes).decode("utf-8")
+                    })
+        except Exception as e:
+            logger.error("Handle text query error: %s", e)
+            await self._send({"type": "error", "message": str(e)})
 
-        # Synthesize TTS in background — don't block the response being shown
-        asyncio.create_task(self._synthesize_and_send(full_text))
-
-    async def _handle_audio_chunk(self, msg: dict) -> None:
-        """Process an ``audio_chunk`` message from the client's microphone.
-
-        Decodes base64 PCM/WAV bytes, transcribes via Whisper, then routes
-        the transcript through the same text_query pipeline.
-
-        Args:
-            msg: Parsed message dict containing ``"data"`` key (base64 string).
-        """
-        data_b64 = msg.get("data", "")
-        if not data_b64:
-            await self._send_error("audio_chunk message missing 'data' field.")
-            return
-
-        if self._stt is None:
-            await self._send_error("STT is not available (no microphone configured).")
+    async def _handle_audio_chunk(self, data: str) -> None:
+        """Handles an incoming audio chunk (base64)."""
+        if not self._stt.is_loaded():
+            await self._send({"type": "error", "message": "STT model not loaded"})
             return
 
         try:
-            audio_bytes = base64.b64decode(data_b64)
-        except Exception:
-            await self._send_error("audio_chunk 'data' is not valid base64.")
-            return
-
-        # Transcription is CPU-bound — run in executor
-        loop = asyncio.get_running_loop()
-        try:
-            text = await loop.run_in_executor(
-                None, self._stt.transcribe_audio_bytes, audio_bytes
-            )
-        except Exception as exc:
-            logger.warning("Audio transcription error: %s", exc)
-            await self._send_error("Transcription failed.")
-            return
-
-        if not text:
-            logger.debug("Audio chunk produced empty transcript — ignoring.")
-            return
-
-        # Route transcript through the standard query pipeline
-        await self._handle_text_query({"type": "text_query", "text": text})
+            audio_bytes = base64.b64decode(data)
+            loop = asyncio.get_running_loop()
+            transcription = await loop.run_in_executor(None, functools.partial(self._stt.transcribe_bytes, audio_bytes, 16000))
+            
+            if transcription:
+                await self._handle_text_query(transcription)
+        except Exception as e:
+            logger.error("Handle audio chunk error: %s", e)
+            await self._send({"type": "error", "message": str(e)})
 
     async def _handle_snapshot(self) -> None:
-        """Process a ``request_snapshot`` message.
+        """Forces an immediate scene description."""
+        self._scene_detector.force_reset()
+        await self._auto_describe()
 
-        Sends the latest detection result immediately (bypasses the 150ms push interval).
-        """
-        result = self._detector.get_latest()
-        if result is None:
-            await self._send_error("No detections available yet.")
-            return
-        await self._send_detections(result)
-
-    # ─────────────────────────── detection push loop ──────────────────────────
-
-    async def _detection_push_loop(self) -> None:
-        """Push detection bounding boxes to the client every 150ms.
-
-        Runs as an independent asyncio task so queries don't stall the overlay.
-        Only sends if a new inference result is available (frame_id changed).
-        """
-        while True:
-            try:
-                result = self._detector.get_latest()
-                if result is not None and result.frame_id != self._last_sent_frame_id:
-                    await self._send_detections(result)
-                    self._last_sent_frame_id = result.frame_id
-            except Exception as exc:
-                logger.debug("Detection push error: %s", exc)
-
-            await asyncio.sleep(_DETECTION_PUSH_INTERVAL_S)
-
-    # ─────────────────────────── TTS helper ───────────────────────────────────
-
-    async def _synthesize_and_send(self, text: str) -> None:
-        """Synthesize TTS for *text* and send the audio over the WebSocket.
-
-        Args:
-            text: The full response text to synthesize.
-        """
+    async def _send(self, payload: dict) -> None:
+        """Helper to send JSON securely."""
         try:
-            wav_bytes = await self._tts.synthesize(text)
-            b64_audio = base64.b64encode(wav_bytes).decode("utf-8")
-            await self._ws.send_json({"type": "audio_chunk", "data": b64_audio})
-        except Exception as exc:
-            logger.warning("TTS synthesis error: %s", exc)
-
-    # ─────────────────────────── send helpers ─────────────────────────────────
-
-    async def _send_detections(self, result: DetectionResult) -> None:
-        """Serialize and send a ``detections`` message.
-
-        Args:
-            result: The :class:`~core.detector.DetectionResult` to serialize.
-        """
-        boxes = [d.to_dict() for d in result.detections]
-        await self._ws.send_json({
-            "type": "detections",
-            "boxes": boxes,
-            "frame_id": result.frame_id,
-        })
-
-    async def _send_error(self, message: str) -> None:
-        """Send an ``error`` message to the client.
-
-        Args:
-            message: Human-readable error description.
-        """
-        logger.warning("Sending error to client: %s", message)
-        try:
-            await self._ws.send_json({"type": "error", "message": message})
+            await self._ws.send_json(payload)
         except Exception:
-            pass   # client may have already disconnected
+            pass

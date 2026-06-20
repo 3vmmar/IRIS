@@ -1,1 +1,13 @@
-# Docker Compose — backend service + optional local model sidecar
+services:
+  iris:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - iris_data:/app
+    restart: unless-stopped
+
+volumes:
+  iris_data:
